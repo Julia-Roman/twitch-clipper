@@ -73,7 +73,7 @@ func FetchPlaylist(url string, retries int) (*m3u8.MediaPlaylist, error) {
 	}
 	defer res.Body.Close()
 
-	mediaPlaylist, _, err := m3u8.DecodeFrom(res.Body, true)
+	mediaPlaylist, _, err := m3u8.DecodeWith(res.Body, true, customDecoders)
 	if err != nil {
 		d.Expiry = time.Now()
 		playlistCache[url] = d
@@ -103,7 +103,7 @@ func FetchMediaPlaylist(playlistURL string) (*m3u8.MediaPlaylist, error) {
 		return nil, fmt.Errorf("bad status code (%v)", res.StatusCode)
 	}
 
-	p, listType, err := m3u8.DecodeFrom(res.Body, true)
+	p, listType, err := m3u8.DecodeWith(res.Body, true, customDecoders)
 	if err != nil {
 		return nil, err
 	}
@@ -148,10 +148,74 @@ func FetchFirstMediaPlaylist(urls []string) (*m3u8.MediaPlaylist, error) {
 	return nil, err
 }
 
+// elapsedTag holds the stream time, in seconds since the broadcast started, of
+// a playlist's first segment. Twitch puts it on both live and archive
+// playlists, and Kick's IVS live playlists carry it under their own name.
+type elapsedTag struct {
+	name    string
+	seconds float64
+	valid   bool
+}
+
+func (t elapsedTag) TagName() string { return t.name }
+
+func (t elapsedTag) SegmentTag() bool { return false }
+
+func (t elapsedTag) Decode(line string) (m3u8.CustomTag, error) {
+	seconds, err := strconv.ParseFloat(strings.TrimPrefix(line, t.name), 64)
+	return elapsedTag{name: t.name, seconds: seconds, valid: err == nil}, nil
+}
+
+func (t elapsedTag) Encode() *bytes.Buffer {
+	return bytes.NewBufferString(t.String())
+}
+
+func (t elapsedTag) String() string {
+	return fmt.Sprintf("%s%.3f", t.name, t.seconds)
+}
+
+var customDecoders = []m3u8.CustomDecoder{
+	elapsedTag{name: "#EXT-X-TWITCH-ELAPSED-SECS:"},
+	elapsedTag{name: "#EXT-X-NET-LIVE-VIDEO-ELAPSED-SECS:"},
+}
+
+func elapsedSeconds(p *m3u8.MediaPlaylist) (float64, bool) {
+	for _, d := range customDecoders {
+		if t, ok := p.Custom[d.TagName()].(elapsedTag); ok && t.valid {
+			return t.seconds, true
+		}
+	}
+	return 0, false
+}
+
+// segmentStarts puts each segment on a timeline shared by both playlists of a
+// broadcast: stream time if the playlist says where it starts, otherwise
+// program date-time.
+func segmentStarts(p *m3u8.MediaPlaylist, segs []*m3u8.MediaSegment, useStreamTime bool) ([]float64, error) {
+	starts := make([]float64, len(segs))
+	if useStreamTime {
+		t, _ := elapsedSeconds(p)
+		for i, seg := range segs {
+			starts[i] = t
+			t += seg.Duration
+		}
+		return starts, nil
+	}
+
+	for i, seg := range segs {
+		if seg.ProgramDateTime.IsZero() {
+			return nil, errors.New("playlist has neither stream time nor program date-time")
+		}
+		starts[i] = float64(seg.ProgramDateTime.UnixMicro()) / 1e6
+	}
+	return starts, nil
+}
+
 // Backfill prepends segments from archive, an older and longer playlist of the
-// same broadcast, to live so the result reaches back at least duration. The
-// two are spliced on program date-time since their segment lengths and URIs
-// have nothing in common.
+// same broadcast, to live so the result reaches back at least duration. Their
+// segment lengths and URIs have nothing in common, so they're spliced on
+// stream time, or on program date-time when either lacks it. Stream time is
+// preferred because some Twitch archives have no program date-time at all.
 func Backfill(archive, live *m3u8.MediaPlaylist, duration time.Duration) (*m3u8.MediaPlaylist, time.Duration, error) {
 	archiveSegs := archive.Segments[:archive.Count()]
 	liveSegs := live.Segments[:live.Count()]
@@ -159,20 +223,30 @@ func Backfill(archive, live *m3u8.MediaPlaylist, duration time.Duration) (*m3u8.
 		return nil, 0, errors.New("empty playlist")
 	}
 
-	last := archiveSegs[len(archiveSegs)-1]
-	if last.ProgramDateTime.IsZero() {
-		return nil, 0, errors.New("archive playlist has no program date-time")
-	}
-	archiveEnd := last.ProgramDateTime.Add(time.Duration(last.Duration * float64(time.Second)))
+	_, archiveHasStreamTime := elapsedSeconds(archive)
+	_, liveHasStreamTime := elapsedSeconds(live)
+	useStreamTime := archiveHasStreamTime && liveHasStreamTime
 
-	const tolerance = 100 * time.Millisecond
-	if liveSegs[0].ProgramDateTime.After(archiveEnd.Add(tolerance)) {
-		return nil, 0, fmt.Errorf("archive ends %v before live playlist starts", liveSegs[0].ProgramDateTime.Sub(archiveEnd))
+	archiveStarts, err := segmentStarts(archive, archiveSegs, useStreamTime)
+	if err != nil {
+		return nil, 0, fmt.Errorf("archive: %w", err)
+	}
+	liveStarts, err := segmentStarts(live, liveSegs, useStreamTime)
+	if err != nil {
+		return nil, 0, fmt.Errorf("live: %w", err)
+	}
+
+	last := len(archiveSegs) - 1
+	archiveEnd := archiveStarts[last] + archiveSegs[last].Duration
+
+	const tolerance = 0.1
+	if liveStarts[0] > archiveEnd+tolerance {
+		return nil, 0, fmt.Errorf("archive ends %.3fs before live playlist starts", liveStarts[0]-archiveEnd)
 	}
 
 	segs := append([]*m3u8.MediaSegment{}, archiveSegs...)
-	for _, seg := range liveSegs {
-		if !seg.ProgramDateTime.Before(archiveEnd.Add(-tolerance)) {
+	for i, seg := range liveSegs {
+		if liveStarts[i] >= archiveEnd-tolerance {
 			segs = append(segs, seg)
 		}
 	}
