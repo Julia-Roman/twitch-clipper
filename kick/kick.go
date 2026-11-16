@@ -2,6 +2,7 @@ package kick
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 	"twitch-clipper/clipper"
@@ -88,4 +89,36 @@ func GetClipInfo(createdAt time.Time, channelName string) (info ClipInfo, err er
 		Channel:   res,
 	}
 	return
+}
+
+type video struct {
+	ID     int    `json:"id"`
+	IsLive bool   `json:"is_live"`
+	Source string `json:"source"`
+}
+
+// DVRPlaylistURL finds the in-progress recording of the current livestream.
+// Unlike Twitch the recording path ends in a random ID, so it has to be looked
+// up rather than derived.
+func DVRPlaylistURL(info ClipInfo) (string, error) {
+	res, err := client.Get("https://kick.com/api/v2/channels/"+info.Channel.Slug+"/videos", make(map[string]string), "")
+	if err != nil {
+		return "", err
+	}
+
+	if res.Status/100 != 2 {
+		return "", fmt.Errorf("bad status code from kick (%v)", res.Status)
+	}
+
+	var videos []video
+	if err := json.Unmarshal([]byte(res.Body), &videos); err != nil {
+		return "", err
+	}
+
+	for _, v := range videos {
+		if v.ID == info.Channel.Livestream.ID && v.IsLive && v.Source != "" {
+			return v.Source, nil
+		}
+	}
+	return "", errors.New("no recording for current livestream")
 }

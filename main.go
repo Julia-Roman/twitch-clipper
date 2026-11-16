@@ -7,15 +7,22 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"twitch-clipper/clipper"
 	"twitch-clipper/kick"
 	"twitch-clipper/twitch"
+
+	"github.com/grafov/m3u8"
 )
 
 const httpHost = "localhost:8989"
 const clipsDir = "/var/www/fi.supa.sh/clips"
+
+// Every DVR segment is held in memory until ffmpeg runs, about 1MB per second
+// at source quality.
+const maxClipDuration = 180 * time.Second
 
 func resError(w http.ResponseWriter, message string, statusCode int) {
 	m := map[string]interface{}{
@@ -26,6 +33,30 @@ func resError(w http.ResponseWriter, message string, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(m)
+}
+
+func playlistDuration(playlist *m3u8.MediaPlaylist) (total time.Duration) {
+	for _, seg := range playlist.Segments[:playlist.Count()] {
+		total += time.Duration(seg.Duration * float64(time.Second))
+	}
+	return
+}
+
+// extendPlaylist reaches back further than the live playlist's ~30s window
+// using the broadcast's archive when the requested duration needs it. On any
+// archive failure the clip falls back to whatever the live playlist covers.
+func extendPlaylist(live *m3u8.MediaPlaylist, dvrURLs []string, duration time.Duration) (*m3u8.MediaPlaylist, time.Duration) {
+	if duration > playlistDuration(live) && len(dvrURLs) > 0 {
+		archive, err := clipper.FetchFirstMediaPlaylist(dvrURLs)
+		if err != nil {
+			log.Println("dvr playlist fetch failed", err)
+		} else if merged, skip, err := clipper.Backfill(archive, live, duration); err != nil {
+			log.Println("dvr backfill failed", err)
+		} else {
+			return merged, skip
+		}
+	}
+	return clipper.Trim(live, duration)
 }
 
 func main() {
@@ -44,7 +75,18 @@ func main() {
 		query := r.URL.Query()
 		infoPath := fmt.Sprintf("%s/%s.info.json", saveDir, clipID)
 
+		var duration time.Duration
+		if d := query.Get("duration"); d != "" {
+			seconds, err := strconv.Atoi(d)
+			if err != nil || seconds <= 0 {
+				resError(w, "invalid duration", 400)
+				return
+			}
+			duration = min(time.Duration(seconds)*time.Second, maxClipDuration)
+		}
+
 		var playlistURL string
+		var dvrURLs []string
 		var data []byte
 		if query.Get("platform") == "kick" {
 			clipInfo, err := kick.GetClipInfo(createdAt, channelName)
@@ -70,6 +112,15 @@ func main() {
 			}
 
 			playlistURL = clipInfo.Channel.PlaybackURL
+
+			if duration > 0 {
+				dvrURL, err := kick.DVRPlaylistURL(clipInfo)
+				if err != nil {
+					log.Println("kick dvr lookup failed", err)
+				} else {
+					dvrURLs = []string{dvrURL}
+				}
+			}
 
 			clipInfo.Channel.PlaybackURL = "" // remove playback URL from saved info
 
@@ -105,6 +156,16 @@ func main() {
 			}
 			log.Println(clipLog.String())
 
+			if duration > 0 {
+				dvrURLs, err = clipInfo.DVRPlaylistURLs()
+				if err != nil {
+					log.Println("dvr playlist guess failed", err)
+				}
+			}
+			if clipInfo.Channel.Stream != nil {
+				clipInfo.Channel.Stream.ArchiveVideo = nil // remove archive URL from saved info
+			}
+
 			data, err = json.Marshal(clipInfo)
 			if err != nil {
 				log.Println("clip info marshal failed", err)
@@ -123,7 +184,12 @@ func main() {
 			return
 		}
 
-		path, err := clipper.MakeClip(saveDir, clipID, channelName, playlist)
+		var skip time.Duration
+		if duration > 0 {
+			playlist, skip = extendPlaylist(playlist, dvrURLs, duration)
+		}
+
+		path, err := clipper.MakeClip(saveDir, clipID, channelName, playlist, skip)
 		if err != nil {
 			resError(w, err.Error(), 500)
 			return

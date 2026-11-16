@@ -1,10 +1,13 @@
 package clipper
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"sort"
@@ -84,7 +87,133 @@ func FetchPlaylist(url string, retries int) (*m3u8.MediaPlaylist, error) {
 	return mediaPlaylist.(*m3u8.MediaPlaylist), nil
 }
 
-func MakeClip(saveDir string, clipID string, channelName string, playlist *m3u8.MediaPlaylist) (string, error) {
+func FetchMediaPlaylist(playlistURL string) (*m3u8.MediaPlaylist, error) {
+	base, err := url.Parse(playlistURL)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := httpClient.Get(playlistURL)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status code (%v)", res.StatusCode)
+	}
+
+	p, listType, err := m3u8.DecodeFrom(res.Body, true)
+	if err != nil {
+		return nil, err
+	}
+	if listType == m3u8.MASTER {
+		variants := p.(*m3u8.MasterPlaylist).Variants
+		if len(variants) == 0 {
+			return nil, errors.New("no stream playlist available")
+		}
+		SortVariantsByResolution(variants)
+		ref, err := url.Parse(variants[0].URI)
+		if err != nil {
+			return nil, err
+		}
+		variantURL := base.ResolveReference(ref).String()
+		if variantURL == playlistURL {
+			return nil, errors.New("master playlist refers to itself")
+		}
+		return FetchMediaPlaylist(variantURL)
+	}
+
+	playlist := p.(*m3u8.MediaPlaylist)
+	for _, seg := range playlist.Segments[:playlist.Count()] {
+		ref, err := url.Parse(seg.URI)
+		if err != nil {
+			return nil, err
+		}
+		seg.URI = base.ResolveReference(ref).String()
+	}
+
+	return playlist, nil
+}
+
+func FetchFirstMediaPlaylist(urls []string) (*m3u8.MediaPlaylist, error) {
+	err := errors.New("no playlist URLs")
+	for _, u := range urls {
+		var p *m3u8.MediaPlaylist
+		p, err = FetchMediaPlaylist(u)
+		if err == nil {
+			return p, nil
+		}
+	}
+	return nil, err
+}
+
+// Backfill prepends segments from archive, an older and longer playlist of the
+// same broadcast, to live so the result reaches back at least duration. The
+// two are spliced on program date-time since their segment lengths and URIs
+// have nothing in common.
+func Backfill(archive, live *m3u8.MediaPlaylist, duration time.Duration) (*m3u8.MediaPlaylist, time.Duration, error) {
+	archiveSegs := archive.Segments[:archive.Count()]
+	liveSegs := live.Segments[:live.Count()]
+	if len(archiveSegs) == 0 || len(liveSegs) == 0 {
+		return nil, 0, errors.New("empty playlist")
+	}
+
+	last := archiveSegs[len(archiveSegs)-1]
+	if last.ProgramDateTime.IsZero() {
+		return nil, 0, errors.New("archive playlist has no program date-time")
+	}
+	archiveEnd := last.ProgramDateTime.Add(time.Duration(last.Duration * float64(time.Second)))
+
+	const tolerance = 100 * time.Millisecond
+	if liveSegs[0].ProgramDateTime.After(archiveEnd.Add(tolerance)) {
+		return nil, 0, fmt.Errorf("archive ends %v before live playlist starts", liveSegs[0].ProgramDateTime.Sub(archiveEnd))
+	}
+
+	segs := append([]*m3u8.MediaSegment{}, archiveSegs...)
+	for _, seg := range liveSegs {
+		if !seg.ProgramDateTime.Before(archiveEnd.Add(-tolerance)) {
+			segs = append(segs, seg)
+		}
+	}
+
+	merged, err := m3u8.NewMediaPlaylist(0, uint(len(segs)))
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, seg := range segs {
+		if err := merged.AppendSegment(seg); err != nil {
+			return nil, 0, err
+		}
+	}
+	merged.Map = live.Map
+
+	trimmed, skip := Trim(merged, duration)
+	return trimmed, skip, nil
+}
+
+// Trim drops leading segments that aren't needed to cover duration and returns
+// how far into the remaining segments the clip should start.
+func Trim(playlist *m3u8.MediaPlaylist, duration time.Duration) (*m3u8.MediaPlaylist, time.Duration) {
+	segs := playlist.Segments[:playlist.Count()]
+
+	var total time.Duration
+	start := len(segs)
+	for start > 0 && total < duration {
+		start--
+		total += time.Duration(segs[start].Duration * float64(time.Second))
+	}
+
+	trimmed, _ := m3u8.NewMediaPlaylist(0, uint(max(len(segs)-start, 1)))
+	for _, seg := range segs[start:] {
+		trimmed.AppendSegment(seg)
+	}
+	trimmed.Map = playlist.Map
+
+	return trimmed, max(total-duration, 0)
+}
+
+func MakeClip(saveDir string, clipID string, channelName string, playlist *m3u8.MediaPlaylist, skip time.Duration) (string, error) {
 	segmentCount := playlist.Count()
 
 	format := "mp4"
@@ -122,6 +251,12 @@ func MakeClip(saveDir string, clipID string, channelName string, playlist *m3u8.
 			}
 
 			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				if !futile {
+					ch <- fmt.Errorf("bad status code for segment %v (%v)", i, res.StatusCode)
+				}
+				return
+			}
 			buf, err := io.ReadAll(res.Body)
 			if !futile {
 				if err != nil {
@@ -145,13 +280,20 @@ func MakeClip(saveDir string, clipID string, channelName string, playlist *m3u8.
 		}
 	}
 
+	if skip > 0 && len(buffer) > 0 {
+		skip = keyframeBefore(append(append([]byte{}, mapBuf...), buffer[0]...), skip)
+	}
+
 	os.MkdirAll(saveDir, os.ModePerm)
 
-	cmd := exec.Command("ffmpeg",
-		"-hide_banner",
-		"-i", "-",
+	args := []string{"-hide_banner", "-i", "-"}
+	if skip > 0 {
+		args = append(args, "-ss", fmt.Sprintf("%.3f", skip.Seconds()))
+	}
+	args = append(args,
 		"-c:v", "copy", "-c:a", "copy", "-c:s", "copy",
 		"-f", format, clipPath)
+	cmd := exec.Command("ffmpeg", args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return "", err
@@ -173,6 +315,60 @@ func MakeClip(saveDir string, clipID string, channelName string, playlist *m3u8.
 	}
 
 	return fmt.Sprintf("%s/%s.%s", channelName, clipID, format), err
+}
+
+// keyframeBefore moves skip back to the last video keyframe in segment. A
+// stream-copy cut drops video until the next keyframe while audio starts right
+// away, so cutting anywhere else leaves the clip opening on audio alone. The
+// keyframe's DTS is used because ffmpeg compares the cut against DTS, which
+// with B-frames sits slightly before the PTS.
+func keyframeBefore(segment []byte, skip time.Duration) time.Duration {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "format=start_time:packet=dts_time,flags",
+		"-of", "json",
+		"-i", "-")
+	cmd.Stdin = bytes.NewReader(segment)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+
+	var probe struct {
+		Format struct {
+			StartTime string `json:"start_time"`
+		} `json:"format"`
+		Packets []struct {
+			DTSTime string `json:"dts_time"`
+			Flags   string `json:"flags"`
+		} `json:"packets"`
+	}
+	if err := json.Unmarshal(out, &probe); err != nil {
+		return 0
+	}
+
+	start, err := strconv.ParseFloat(probe.Format.StartTime, 64)
+	if err != nil {
+		return 0
+	}
+
+	var best time.Duration
+	for _, p := range probe.Packets {
+		if !strings.HasPrefix(p.Flags, "K") {
+			continue
+		}
+		dts, err := strconv.ParseFloat(p.DTSTime, 64)
+		if err != nil {
+			continue
+		}
+		offset := time.Duration((dts - start) * float64(time.Second))
+		if offset > skip {
+			break
+		}
+		best = max(best, offset)
+	}
+	return best
 }
 
 func SortVariantsByResolution(variants []*m3u8.Variant) {
