@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/grafov/m3u8"
 )
 
 const clientID = "ue6666qo983tsx6so1t0vnawi233wa"
@@ -126,10 +129,10 @@ var dvrHosts = []string{
 	"d3aqoihi2n8ty8.cloudfront.net",
 }
 
-// DVRPlaylistURLs guesses where the in-progress archive of the current
-// broadcast lives. Archive directories are named
+// DVRDirs guesses where the in-progress archive of the current broadcast
+// lives. Archive directories are named
 // sha1(login_streamID_startUnix)[:20] + "_" + login_streamID_startUnix.
-func (info ClipInfo) DVRPlaylistURLs() ([]string, error) {
+func (info ClipInfo) DVRDirs() ([]string, error) {
 	if info.Channel == nil || info.Channel.Stream == nil || info.Channel.Stream.ID == "" {
 		return nil, errors.New("channel is not live")
 	}
@@ -144,12 +147,12 @@ func (info ClipInfo) DVRPlaylistURLs() ([]string, error) {
 	sum := sha1.Sum([]byte(name))
 	dir := hex.EncodeToString(sum[:])[:20] + "_" + name
 
-	var urls []string
+	var dirs []string
 	hosts := dvrHosts
 	if stream.ArchiveVideo != nil {
 		if u, err := url.Parse(stream.ArchiveVideo.SeekPreviewsURL); err == nil && u.Host != "" {
 			if archiveDir, _, ok := strings.Cut(strings.TrimPrefix(u.Path, "/"), "/"); ok && archiveDir != dir {
-				urls = append(urls, fmt.Sprintf("https://%s/%s/chunked/index-dvr.m3u8", u.Host, archiveDir))
+				dirs = append(dirs, fmt.Sprintf("https://%s/%s", u.Host, archiveDir))
 			}
 			hosts = append([]string{u.Host}, dvrHosts...)
 		}
@@ -161,7 +164,28 @@ func (info ClipInfo) DVRPlaylistURLs() ([]string, error) {
 			continue
 		}
 		seen[host] = true
-		urls = append(urls, fmt.Sprintf("https://%s/%s/chunked/index-dvr.m3u8", host, dir))
+		dirs = append(dirs, fmt.Sprintf("https://%s/%s", host, dir))
 	}
-	return urls, nil
+	return dirs, nil
+}
+
+// DVRPlaylistURLs lists the archive playlists in dirs, preferring the
+// rendition of the live variant being clipped so the two splice together.
+// "chunked" holds the source rendition, which can be in a codec the live
+// playlist doesn't offer, and transcodes are named like 1080p60.
+func DVRPlaylistURLs(dirs []string, live *m3u8.Variant) []string {
+	renditions := []string{"chunked"}
+	if live != nil && live.FrameRate > 0 {
+		if _, h, ok := strings.Cut(live.Resolution, "x"); ok {
+			renditions = append([]string{fmt.Sprintf("%sp%d", h, int(math.Round(live.FrameRate)))}, renditions...)
+		}
+	}
+
+	var urls []string
+	for _, dir := range dirs {
+		for _, r := range renditions {
+			urls = append(urls, fmt.Sprintf("%s/%s/index-dvr.m3u8", dir, r))
+		}
+	}
+	return urls
 }

@@ -46,15 +46,20 @@ func playlistDuration(playlist *m3u8.MediaPlaylist) (total time.Duration) {
 // using the broadcast's archive when the requested duration needs it. On any
 // archive failure the clip falls back to whatever the live playlist covers.
 func extendPlaylist(live *m3u8.MediaPlaylist, dvrURLs []string, duration time.Duration) (*m3u8.MediaPlaylist, time.Duration) {
-	if duration > playlistDuration(live) && len(dvrURLs) > 0 {
-		archive, err := clipper.FetchFirstMediaPlaylist(dvrURLs)
-		if err != nil {
-			log.Println("dvr playlist fetch failed", err)
-		} else if merged, skip, err := clipper.Backfill(archive, live, duration); err != nil {
-			log.Println("dvr backfill failed", err)
-		} else {
+	if duration > playlistDuration(live) {
+		for _, u := range dvrURLs {
+			archive, err := clipper.FetchMediaPlaylist(u)
+			if err != nil {
+				continue
+			}
+			merged, skip, err := clipper.Backfill(archive, live, duration)
+			if err != nil {
+				log.Println("dvr backfill failed", u, err)
+				continue
+			}
 			return merged, skip
 		}
+		log.Println("no usable dvr playlist")
 	}
 	return clipper.Trim(live, duration)
 }
@@ -86,7 +91,7 @@ func main() {
 		}
 
 		var playlistURL string
-		var dvrURLs []string
+		var dvrURLs, twitchDVRDirs []string
 		var data []byte
 		if query.Get("platform") == "kick" {
 			clipInfo, err := kick.GetClipInfo(createdAt, channelName)
@@ -157,7 +162,7 @@ func main() {
 			log.Println(clipLog.String())
 
 			if duration > 0 {
-				dvrURLs, err = clipInfo.DVRPlaylistURLs()
+				twitchDVRDirs, err = clipInfo.DVRDirs()
 				if err != nil {
 					log.Println("dvr playlist guess failed", err)
 				}
@@ -173,7 +178,7 @@ func main() {
 			}
 		}
 
-		playlist, err := clipper.FetchPlaylist(playlistURL, 0)
+		playlist, variant, err := clipper.FetchPlaylist(playlistURL, 0)
 		if err != nil {
 			statusCode := 500
 			if errors.Is(err, clipper.ErrStreamNotFound) {
@@ -186,6 +191,9 @@ func main() {
 
 		var skip time.Duration
 		if duration > 0 {
+			if twitchDVRDirs != nil {
+				dvrURLs = twitch.DVRPlaylistURLs(twitchDVRDirs, variant)
+			}
 			playlist, skip = extendPlaylist(playlist, dvrURLs, duration)
 		}
 

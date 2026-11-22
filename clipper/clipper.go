@@ -30,9 +30,11 @@ var playlistCache = map[string]pCache{}
 
 var httpClient = &http.Client{Timeout: time.Minute}
 
-func FetchPlaylist(url string, retries int) (*m3u8.MediaPlaylist, error) {
+// FetchPlaylist returns the media playlist of the best variant along with
+// that variant.
+func FetchPlaylist(url string, retries int) (*m3u8.MediaPlaylist, *m3u8.Variant, error) {
 	if retries > 3 {
-		return nil, fmt.Errorf("failed fetching stream segments after %v tries", retries)
+		return nil, nil, fmt.Errorf("failed fetching stream segments after %v tries", retries)
 	}
 
 	d := playlistCache[url]
@@ -40,20 +42,20 @@ func FetchPlaylist(url string, retries int) (*m3u8.MediaPlaylist, error) {
 	if time.Now().After(d.Expiry) {
 		res, err := httpClient.Get(url)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		defer res.Body.Close()
 
 		if res.StatusCode == http.StatusNotFound {
-			return nil, ErrStreamNotFound
+			return nil, nil, ErrStreamNotFound
 		} else if res.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("bad status code (%v)", res.StatusCode)
+			return nil, nil, fmt.Errorf("bad status code (%v)", res.StatusCode)
 		}
 
 		p, _, err := m3u8.DecodeFrom(res.Body, false)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		d.MasterPlaylist = p.(*m3u8.MasterPlaylist)
@@ -62,14 +64,14 @@ func FetchPlaylist(url string, retries int) (*m3u8.MediaPlaylist, error) {
 	variants := d.MasterPlaylist.Variants
 
 	if len(variants) == 0 {
-		return nil, errors.New("no stream playlist available")
+		return nil, nil, errors.New("no stream playlist available")
 	}
 
-	SortVariantsByResolution(variants)
+	SortVariants(variants)
 
 	res, err := httpClient.Get(variants[0].URI)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
 
@@ -84,7 +86,7 @@ func FetchPlaylist(url string, retries int) (*m3u8.MediaPlaylist, error) {
 
 	playlistCache[url] = d
 
-	return mediaPlaylist.(*m3u8.MediaPlaylist), nil
+	return mediaPlaylist.(*m3u8.MediaPlaylist), variants[0], nil
 }
 
 func FetchMediaPlaylist(playlistURL string) (*m3u8.MediaPlaylist, error) {
@@ -112,7 +114,7 @@ func FetchMediaPlaylist(playlistURL string) (*m3u8.MediaPlaylist, error) {
 		if len(variants) == 0 {
 			return nil, errors.New("no stream playlist available")
 		}
-		SortVariantsByResolution(variants)
+		SortVariants(variants)
 		ref, err := url.Parse(variants[0].URI)
 		if err != nil {
 			return nil, err
@@ -124,28 +126,37 @@ func FetchMediaPlaylist(playlistURL string) (*m3u8.MediaPlaylist, error) {
 		return FetchMediaPlaylist(variantURL)
 	}
 
-	playlist := p.(*m3u8.MediaPlaylist)
-	for _, seg := range playlist.Segments[:playlist.Count()] {
-		ref, err := url.Parse(seg.URI)
+	resolve := func(uri string) (string, error) {
+		ref, err := url.Parse(uri)
 		if err != nil {
+			return "", err
+		}
+		return base.ResolveReference(ref).String(), nil
+	}
+
+	playlist := p.(*m3u8.MediaPlaylist)
+	if playlist.Map != nil {
+		if playlist.Map.URI, err = resolve(playlist.Map.URI); err != nil {
 			return nil, err
 		}
-		seg.URI = base.ResolveReference(ref).String()
+	}
+	// Every segment gets the init section in effect for it, so the ones kept
+	// after trimming can still be checked against the live playlist's.
+	var segMap *m3u8.Map
+	for _, seg := range playlist.Segments[:playlist.Count()] {
+		if seg.URI, err = resolve(seg.URI); err != nil {
+			return nil, err
+		}
+		if seg.Map != nil {
+			if seg.Map.URI, err = resolve(seg.Map.URI); err != nil {
+				return nil, err
+			}
+			segMap = seg.Map
+		}
+		seg.Map = segMap
 	}
 
 	return playlist, nil
-}
-
-func FetchFirstMediaPlaylist(urls []string) (*m3u8.MediaPlaylist, error) {
-	err := errors.New("no playlist URLs")
-	for _, u := range urls {
-		var p *m3u8.MediaPlaylist
-		p, err = FetchMediaPlaylist(u)
-		if err == nil {
-			return p, nil
-		}
-	}
-	return nil, err
 }
 
 // elapsedTag holds the stream time, in seconds since the broadcast started, of
@@ -222,6 +233,9 @@ func Backfill(archive, live *m3u8.MediaPlaylist, duration time.Duration) (*m3u8.
 	if len(archiveSegs) == 0 || len(liveSegs) == 0 {
 		return nil, 0, errors.New("empty playlist")
 	}
+	if (archive.Map == nil) != (live.Map == nil) {
+		return nil, 0, errors.New("archive and live playlists use different containers")
+	}
 
 	_, archiveHasStreamTime := elapsedSeconds(archive)
 	_, liveHasStreamTime := elapsedSeconds(live)
@@ -263,7 +277,81 @@ func Backfill(archive, live *m3u8.MediaPlaylist, duration time.Duration) (*m3u8.
 	merged.Map = live.Map
 
 	trimmed, skip := Trim(merged, duration)
+	if err := checkInits(trimmed); err != nil {
+		return nil, 0, err
+	}
 	return trimmed, skip, nil
+}
+
+// checkInits makes sure every segment decodes with the playlist's init
+// section, the only one MakeClip hands to ffmpeg. An archive rendition in
+// another codec or resolution than the live variant would otherwise leave its
+// part of the clip without video.
+func checkInits(p *m3u8.MediaPlaylist) error {
+	if p.Map == nil {
+		return nil
+	}
+	want, err := fetchBytes(p.Map.URI)
+	if err != nil {
+		return err
+	}
+	var wantTracks string
+
+	checked := map[string]bool{p.Map.URI: true}
+	for _, seg := range p.Segments[:p.Count()] {
+		if seg.Map == nil || checked[seg.Map.URI] {
+			continue
+		}
+		checked[seg.Map.URI] = true
+
+		got, err := fetchBytes(seg.Map.URI)
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(got, want) {
+			continue
+		}
+		if wantTracks == "" {
+			if wantTracks, err = probeTracks(want); err != nil {
+				return err
+			}
+		}
+		gotTracks, err := probeTracks(got)
+		if err != nil {
+			return err
+		}
+		if gotTracks != wantTracks {
+			return fmt.Errorf("archive tracks (%s) don't match live tracks (%s)", gotTracks, wantTracks)
+		}
+	}
+	return nil
+}
+
+func fetchBytes(url string) ([]byte, error) {
+	res, err := httpClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status code for %s (%v)", url, res.StatusCode)
+	}
+	return io.ReadAll(res.Body)
+}
+
+func probeTracks(init []byte) (string, error) {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-show_data_hash", "md5",
+		"-show_entries", "stream=codec_name,profile,width,height,sample_rate,channels,extradata_hash",
+		"-of", "compact",
+		"-i", "-")
+	cmd.Stdin = bytes.NewReader(init)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe init: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // Trim drops leading segments that aren't needed to cover duration and returns
@@ -445,7 +533,13 @@ func keyframeBefore(segment []byte, skip time.Duration) time.Duration {
 	return best
 }
 
-func SortVariantsByResolution(variants []*m3u8.Variant) {
+// SortVariants puts H.264 variants first, then orders by resolution. Archives
+// only keep the source rendition in its original codec, so sticking to H.264
+// keeps the live variant spliceable with an archive rendition.
+func SortVariants(variants []*m3u8.Variant) {
+	isH264 := func(v *m3u8.Variant) bool {
+		return v.Codecs == "" || strings.Contains(v.Codecs, "avc1")
+	}
 	parseRes := func(res string) (w, h int) {
 		parts := strings.Split(res, "x")
 		if len(parts) != 2 {
@@ -456,6 +550,9 @@ func SortVariantsByResolution(variants []*m3u8.Variant) {
 		return
 	}
 	sort.SliceStable(variants, func(i, j int) bool {
+		if a, b := isH264(variants[i]), isH264(variants[j]); a != b {
+			return a
+		}
 		w1, h1 := parseRes(variants[i].Resolution)
 		w2, h2 := parseRes(variants[j].Resolution)
 		if w1 != w2 {
